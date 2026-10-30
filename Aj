@@ -1,0 +1,314 @@
+-- ===== Config =====
+local WS_URL   = "wss://mcnuggets.live/api/site/feed/TM2fJ84cZyYyaSfNyzCVu-lpVAcs3uFDlRXJKF_B6k0"
+local MIN_GEN  = 0        -- only auto-join at/above this generation
+local MAX_AGE  = 15       -- seconds (only used if the feed sends a timestamp)
+local ATTEMPTS = 5
+local MAX_ROWS = 40
+
+-- ===== Services =====
+local HttpService     = game:GetService("HttpService")
+local TeleportService = game:GetService("TeleportService")
+local Players         = game:GetService("Players")
+local UIS             = game:GetService("UserInputService")
+local TweenService    = game:GetService("TweenService")
+local player          = Players.LocalPlayer
+
+local connect = (WebSocket and WebSocket.connect)
+    or (syn and syn.websocket and syn.websocket.connect)
+
+-- ===== Theme =====
+local C = {
+    bg = Color3.fromRGB(13, 11, 14), side = Color3.fromRGB(17, 14, 18),
+    el = Color3.fromRGB(26, 21, 27), hover = Color3.fromRGB(36, 27, 36),
+    accent = Color3.fromRGB(232, 106, 155), text = Color3.fromRGB(236, 228, 233),
+    dim = Color3.fromRGB(150, 132, 143), good = Color3.fromRGB(110, 200, 140),
+    warn = Color3.fromRGB(215, 185, 110), bad = Color3.fromRGB(210, 95, 105),
+}
+
+local function make(class, props, children)
+    local o = Instance.new(class)
+    for k, v in pairs(props) do o[k] = v end
+    for _, ch in ipairs(children or {}) do ch.Parent = o end
+    return o
+end
+local function corner(r) return make("UICorner", { CornerRadius = UDim.new(0, r) }) end
+
+-- ===== State =====
+local state = { autoJoin = false, joining = false, seen = {}, order = 0, rows = {} }
+
+-- ===== UI =====
+local gui = make("ScreenGui", { Name = "MyJoiner", ResetOnSpawn = false, IgnoreGuiInset = true, DisplayOrder = 999 })
+pcall(function() gui.Parent = (gethui and gethui()) or game:GetService("CoreGui") end)
+if not gui.Parent then gui.Parent = player:WaitForChild("PlayerGui") end
+
+local win = make("Frame", { Size = UDim2.fromOffset(600, 420), Position = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint = Vector2.new(0.5, 0.5), BackgroundColor3 = C.bg, BorderSizePixel = 0, Active = true,
+    ClipsDescendants = true, Parent = gui }, { corner(12) })
+
+local top = make("Frame", { Size = UDim2.new(1, 0, 0, 44), BackgroundTransparency = 1, Parent = win })
+make("TextLabel", { Position = UDim2.fromOffset(16, 0), Size = UDim2.fromOffset(160, 44), BackgroundTransparency = 1,
+    Font = Enum.Font.GothamBold, Text = "My Joiner", TextColor3 = C.text, TextSize = 18,
+    TextXAlignment = Enum.TextXAlignment.Left, Parent = top })
+
+local dot = make("Frame", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -100, 0.5, 0),
+    Size = UDim2.fromOffset(9, 9), BackgroundColor3 = C.bad, BorderSizePixel = 0, Parent = top }, { corner(5) })
+local statusLbl = make("TextLabel", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, -112, 0.5, 0),
+    Size = UDim2.fromOffset(110, 20), BackgroundTransparency = 1, Font = Enum.Font.Gotham, Text = "Offline",
+    TextColor3 = C.dim, TextSize = 13, TextXAlignment = Enum.TextXAlignment.Right, Parent = top })
+
+local function topBtn(txt, x, col)
+    return make("TextButton", { AnchorPoint = Vector2.new(1, 0.5), Position = UDim2.new(1, x, 0.5, 0),
+        Size = UDim2.fromOffset(28, 28), BackgroundColor3 = col, AutoButtonColor = true, Font = Enum.Font.GothamBold,
+        Text = txt, TextColor3 = C.text, TextSize = 16, Parent = top }, { corner(8) })
+end
+local closeBtn = topBtn("×", -10, Color3.fromRGB(170, 62, 78))
+local minBtn = topBtn("—", -44, C.el)
+
+make("Frame", { Position = UDim2.fromOffset(0, 44), Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = C.hover,
+    BorderSizePixel = 0, Parent = win })
+
+local side = make("Frame", { Position = UDim2.fromOffset(0, 45), Size = UDim2.new(0, 112, 1, -45),
+    BackgroundColor3 = C.side, BorderSizePixel = 0, Parent = win })
+make("UIListLayout", { Padding = UDim.new(0, 4), HorizontalAlignment = Enum.HorizontalAlignment.Center, Parent = side })
+make("UIPadding", { PaddingTop = UDim.new(0, 10), Parent = side })
+
+local content = make("Frame", { Position = UDim2.fromOffset(113, 45), Size = UDim2.new(1, -113, 1, -45),
+    BackgroundTransparency = 1, Parent = win })
+
+-- drag
+do
+    local dragging, start, orig
+    top.InputBegan:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then
+            dragging, start, orig = true, i.Position, win.Position
+        end
+    end)
+    UIS.InputChanged:Connect(function(i)
+        if dragging and (i.UserInputType == Enum.UserInputType.MouseMovement or i.UserInputType == Enum.UserInputType.Touch) then
+            local d = i.Position - start
+            win.Position = UDim2.new(orig.X.Scale, orig.X.Offset + d.X, orig.Y.Scale, orig.Y.Offset + d.Y)
+        end
+    end)
+    UIS.InputEnded:Connect(function(i)
+        if i.UserInputType == Enum.UserInputType.MouseButton1 or i.UserInputType == Enum.UserInputType.Touch then dragging = false end
+    end)
+end
+
+-- tabs
+local pages, tabBtns = {}, {}
+local function showTab(name)
+    for n, p in pairs(pages) do
+        p.Visible = (n == name)
+        tabBtns[n].TextColor3 = (n == name) and C.accent or C.dim
+        tabBtns[n].BackgroundColor3 = C.el
+        tabBtns[n].BackgroundTransparency = (n == name) and 0.7 or 1
+    end
+end
+local function addTab(name)
+    local page = make("Frame", { Size = UDim2.fromScale(1, 1), BackgroundTransparency = 1, Visible = false, Parent = content })
+    make("UIPadding", { PaddingLeft = UDim.new(0, 14), PaddingRight = UDim.new(0, 14), PaddingTop = UDim.new(0, 10), Parent = page })
+    local b = make("TextButton", { Size = UDim2.new(1, -16, 0, 32), BackgroundTransparency = 1, Font = Enum.Font.GothamMedium,
+        Text = name, TextColor3 = C.dim, TextSize = 15, Parent = side }, { corner(8) })
+    pages[name], tabBtns[name] = page, b
+    b.MouseButton1Click:Connect(function() showTab(name) end)
+    return page
+end
+
+local function button(parent, text, pos, size, col)
+    return make("TextButton", { Position = pos, Size = size, BackgroundColor3 = col or C.el, AutoButtonColor = true,
+        Font = Enum.Font.GothamMedium, Text = text, TextColor3 = C.text, TextSize = 15, Parent = parent }, { corner(8) })
+end
+
+-- ===== Feed page =====
+local feed = addTab("Feed")
+
+local ajBtn = button(feed, "Auto Join: OFF", UDim2.fromOffset(0, 0), UDim2.new(0.34, -4, 0, 32))
+local rejoinBtn = button(feed, "Rejoin", UDim2.new(0.34, 2, 0, 0), UDim2.new(0.33, -4, 0, 32), Color3.fromRGB(150, 62, 74))
+local clearBtn = button(feed, "Clear", UDim2.new(0.67, 2, 0, 0), UDim2.new(0.33, -2, 0, 32), Color3.fromRGB(64, 36, 52))
+
+-- join by job id
+local jobBox = make("TextBox", { Position = UDim2.fromOffset(0, 40), Size = UDim2.new(1, -90, 0, 30), BackgroundColor3 = C.el,
+    ClearTextOnFocus = false, Font = Enum.Font.Gotham, PlaceholderText = "Paste a Job ID...", PlaceholderColor3 = C.dim,
+    Text = "", TextColor3 = C.text, TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, Parent = feed },
+    { corner(8), make("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+local joinIdBtn = button(feed, "JOIN", UDim2.new(1, -82, 0, 40), UDim2.fromOffset(82, 30), C.good)
+joinIdBtn.TextColor3 = Color3.fromRGB(16, 24, 18)
+
+local rawLbl = make("TextLabel", { Position = UDim2.fromOffset(0, 74), Size = UDim2.new(1, 0, 0, 14), BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham, Text = "Last message: —", TextColor3 = C.dim, TextSize = 11,
+    TextTruncate = Enum.TextTruncate.AtEnd, TextXAlignment = Enum.TextXAlignment.Left, Parent = feed })
+
+local list = make("ScrollingFrame", { Position = UDim2.fromOffset(0, 92), Size = UDim2.new(1, 0, 1, -100),
+    BackgroundColor3 = C.side, BorderSizePixel = 0, ScrollBarThickness = 3, ScrollBarImageColor3 = C.accent,
+    CanvasSize = UDim2.new(), AutomaticCanvasSize = Enum.AutomaticSize.Y, Parent = feed }, { corner(10) })
+make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder, Parent = list })
+make("UIPadding", { PaddingTop = UDim.new(0, 6), PaddingLeft = UDim.new(0, 6), PaddingRight = UDim.new(0, 6), Parent = list })
+
+-- ===== Settings page =====
+local settings = addTab("Settings")
+make("TextLabel", { Size = UDim2.new(1, 0, 0, 20), BackgroundTransparency = 1, Font = Enum.Font.GothamBold,
+    Text = "Min generation (auto-join)", TextColor3 = C.accent, TextSize = 15, TextXAlignment = Enum.TextXAlignment.Left, Parent = settings })
+local minBox = make("TextBox", { Position = UDim2.fromOffset(0, 26), Size = UDim2.new(1, 0, 0, 32), BackgroundColor3 = C.el,
+    ClearTextOnFocus = false, Font = Enum.Font.Gotham, Text = tostring(MIN_GEN), PlaceholderText = "e.g. 5M", TextColor3 = C.text,
+    TextSize = 14, TextXAlignment = Enum.TextXAlignment.Left, Parent = settings },
+    { corner(8), make("UIPadding", { PaddingLeft = UDim.new(0, 10) }) })
+make("TextLabel", { Position = UDim2.fromOffset(0, 66), Size = UDim2.new(1, 0, 0, 40), BackgroundTransparency = 1,
+    Font = Enum.Font.Gotham, Text = "Accepts 5000000 or 5M / 1.5B style values.", TextColor3 = C.dim, TextSize = 13,
+    TextWrapped = true, TextXAlignment = Enum.TextXAlignment.Left, TextYAlignment = Enum.TextYAlignment.Top, Parent = settings })
+
+-- ===== Logic =====
+local function setStatus(kind)
+    local m = { live = { "Live", C.good }, connecting = { "Connecting...", C.warn }, offline = { "Offline", C.bad } }
+    local s = m[kind] or m.offline
+    statusLbl.Text, statusLbl.TextColor3, dot.BackgroundColor3 = s[1], s[2], s[2]
+end
+
+local function parseGen(v)
+    if type(v) == "number" then return v end
+    local s = tostring(v or ""):gsub("/s", "")
+    s = s:gsub("[%s,%$]", "")
+    local n, suf = s:match("^([%d%.]+)(%a*)$")
+    n = tonumber(n)
+    if not n then return 0 end
+    local mult = { K = 1e3, M = 1e6, B = 1e9, T = 1e12 }
+    return n * (mult[suf:upper()] or 1)
+end
+local function fmtGen(n)
+    local u = { "", "K", "M", "B", "T" }
+    local i = 1
+    while n >= 1000 and i < #u do n, i = n / 1000, i + 1 end
+    local s = ("%.1f"):format(n):gsub("%.0$", "")
+    return s .. u[i] .. "/s"
+end
+
+local function pick(t, keys)
+    for _, k in ipairs(keys) do if t[k] ~= nil then return t[k] end end
+end
+
+-- Accepts several common shapes; unknown formats still show the raw text.
+local function normalize(raw)
+    local out = {}
+    local ok, msg = pcall(HttpService.JSONDecode, HttpService, raw)
+    if ok and type(msg) == "table" then
+        local items = pick(msg, { "data", "payload", "servers", "jobs", "items" }) or msg
+        if type(items) ~= "table" then items = msg end
+        if items[1] == nil then items = { items } end
+        for _, d in ipairs(items) do
+            if type(d) == "table" then
+                local jid = pick(d, { "jobId", "job_id", "JobId", "jobID", "serverId", "server_id", "id" })
+                if type(jid) == "string" then
+                    local name = pick(d, { "name", "brainrot", "brainrotName", "displayName", "DisplayName", "animal", "Name" })
+                    if type(name) == "table" then name = name[1] end
+                    out[#out + 1] = { jobId = jid, name = tostring(name or "Unknown"),
+                        gen = parseGen(pick(d, { "gen", "generation", "Generation", "income", "value" })),
+                        ts = tonumber(pick(d, { "ts", "timestamp", "time" })) }
+                end
+            end
+        end
+    else
+        local jid = tostring(raw):match("%x+%-%x+%-%x+%-%x+%-%x+")
+        if jid then out[1] = { jobId = jid, name = tostring(raw):sub(1, 40), gen = 0 } end
+    end
+    return out
+end
+
+local function joinServer(jobId, label)
+    if state.joining then return end
+    state.joining = true
+    statusLbl.Text = "Joining " .. (label or "server") .. "..."
+    task.spawn(function()
+        for _ = 1, ATTEMPTS do
+            pcall(function() TeleportService:TeleportToPlaceInstance(game.PlaceId, jobId, player) end)
+            task.wait(3)
+        end
+        state.joining = false
+        setStatus(state.live and "live" or "offline")
+    end)
+end
+
+local function addRow(d)
+    state.order += 1
+    local row = make("Frame", { Size = UDim2.new(1, 0, 0, 48), BackgroundColor3 = C.el, BorderSizePixel = 0,
+        LayoutOrder = -state.order, Parent = list }, { corner(8) })
+    make("TextLabel", { Position = UDim2.fromOffset(12, 5), Size = UDim2.new(1, -90, 0, 20), BackgroundTransparency = 1,
+        Font = Enum.Font.GothamBold, Text = d.name, TextColor3 = C.text, TextSize = 15,
+        TextTruncate = Enum.TextTruncate.AtEnd, TextXAlignment = Enum.TextXAlignment.Left, Parent = row })
+    local sub = make("TextLabel", { Position = UDim2.fromOffset(12, 26), Size = UDim2.new(1, -90, 0, 16), BackgroundTransparency = 1,
+        Font = Enum.Font.Gotham, Text = "", TextColor3 = C.dim, TextSize = 12,
+        TextTruncate = Enum.TextTruncate.AtEnd, TextXAlignment = Enum.TextXAlignment.Left, Parent = row })
+    local born = os.clock()
+    task.spawn(function()
+        while row.Parent do
+            sub.Text = ("%s  ·  %ds  ·  %s"):format(d.gen > 0 and fmtGen(d.gen) or "?", math.floor(os.clock() - born), d.jobId:sub(1, 8))
+            task.wait(1)
+        end
+    end)
+    local jb = button(row, "JOIN", UDim2.new(1, -66, 0.5, -14), UDim2.fromOffset(58, 28), C.good)
+    jb.TextColor3 = Color3.fromRGB(16, 24, 18)
+    jb.MouseButton1Click:Connect(function() joinServer(d.jobId, d.name) end)
+
+    table.insert(state.rows, row)
+    while #state.rows > MAX_ROWS do table.remove(state.rows, 1):Destroy() end
+end
+
+local function onMessage(raw)
+    rawLbl.Text = "Last message: " .. tostring(raw):gsub("%s+", " ")
+    for _, d in ipairs(normalize(raw)) do
+        local last = state.seen[d.jobId]
+        if not last or os.clock() - last > 60 then
+            state.seen[d.jobId] = os.clock()
+            addRow(d)
+            local fresh = not d.ts or (os.time() - d.ts) <= MAX_AGE
+            if state.autoJoin and fresh and d.gen >= parseGen(minBox.Text) and d.jobId ~= game.JobId then
+                joinServer(d.jobId, d.name)
+            end
+        end
+    end
+end
+
+-- buttons
+ajBtn.MouseButton1Click:Connect(function()
+    state.autoJoin = not state.autoJoin
+    ajBtn.Text = "Auto Join: " .. (state.autoJoin and "ON" or "OFF")
+    ajBtn.TextColor3 = state.autoJoin and C.good or C.text
+end)
+rejoinBtn.MouseButton1Click:Connect(function() pcall(function() TeleportService:TeleportReconnect() end) end)
+clearBtn.MouseButton1Click:Connect(function()
+    for _, r in ipairs(state.rows) do r:Destroy() end
+    state.rows = {}
+end)
+joinIdBtn.MouseButton1Click:Connect(function()
+    local id = jobBox.Text:gsub("%s", "")
+    if #id > 8 then joinServer(id, "Job ID") end
+end)
+closeBtn.MouseButton1Click:Connect(function() state.dead = true gui:Destroy() end)
+
+local minimized = false
+minBtn.MouseButton1Click:Connect(function()
+    minimized = not minimized
+    side.Visible, content.Visible = not minimized, not minimized
+    TweenService:Create(win, TweenInfo.new(0.2), { Size = minimized and UDim2.fromOffset(600, 45) or UDim2.fromOffset(600, 420) }):Play()
+end)
+
+showTab("Feed")
+setStatus("offline")
+
+-- ===== Connection loop =====
+task.spawn(function()
+    if not connect then rawLbl.Text = "Executor has no WebSocket API" return end
+    while not state.dead do
+        setStatus("connecting")
+        local ok, ws = pcall(connect, WS_URL)
+        if ok and ws then
+            state.live = true
+            setStatus("live")
+            local closed = false
+            ws.OnMessage:Connect(onMessage)
+            ws.OnClose:Connect(function() closed = true end)
+            while not closed and not state.dead do task.wait(1) end
+            state.live = false
+        end
+        setStatus("offline")
+        task.wait(3)
+    end
+end)
